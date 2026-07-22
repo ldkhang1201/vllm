@@ -653,7 +653,9 @@ if has_flashinfer():
     ) -> torch.Tensor:
         from flashinfer import bmm_fp8 as bmm_fp8_
 
-        return bmm_fp8_(A, B, A_scale, B_scale, dtype, None, backend)
+        return bmm_fp8_(
+            A, B, A_scale, B_scale, dtype, None, _resolve_bmm_fp8_backend(backend)
+        )
 
     @torch.library.register_fake(
         "vllm::bmm_fp8",
@@ -861,6 +863,21 @@ def flashinfer_scaled_fp4_mm_out(
     return out
 
 
+@functools.cache
+def _is_bmm_fp8_auto_unsafe() -> bool:
+    return current_platform.is_device_capability_family(120)
+
+
+def _resolve_bmm_fp8_backend(backend: str) -> str:
+    # On SM12x, autotuned cuBLASLt/cuDNN FP8 GEMM tactics baked into CUDA
+    # graphs MMU-fault at first replay (Xid 31, FE FAULT_PDE write): their
+    # handle-owned semaphore/event sync is not capture-safe on these parts.
+    # Restrict "auto" to the CUTLASS runner, which carries no such state.
+    if backend == "auto" and _is_bmm_fp8_auto_unsafe():
+        return "cutlass"
+    return backend
+
+
 def flashinfer_scaled_fp8_mm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -918,7 +935,7 @@ def flashinfer_scaled_fp8_mm_out(
         scale_b,
         out_dtype or out.dtype,
         out.unsqueeze(0),
-        "auto",
+        _resolve_bmm_fp8_backend("auto"),
     )
     return out
 

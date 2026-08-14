@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
+import inspect
 
 import torch
 
@@ -40,6 +42,36 @@ logger = init_logger(__name__)
 # Base scale for per-token NVFP4 activation quant; the kernel folds the
 # per-token global scale (from the activation amax) on top of it.
 _PER_TOKEN_BASE_GLOBAL_SCALE = 1.0 / (448.0 * 6.0)
+
+
+@functools.cache
+def _fi_fp4_moe_accepted_params(
+    kwarg_names: frozenset[str],
+) -> frozenset[str] | None:
+    """Validate call kwargs against the installed FlashInfer wrapper.
+
+    Returns the parameter names of ``trtllm_fp4_block_scale_moe`` so the
+    call site can feature-detect optional kwargs, or ``None`` when the
+    signature cannot be introspected. Raises when vLLM passes a kwarg the
+    installed wrapper does not accept (call-contract drift).
+    """
+    import flashinfer
+
+    try:
+        sig = inspect.signature(flashinfer.fused_moe.trtllm_fp4_block_scale_moe)
+    except (TypeError, ValueError):
+        return None
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return None
+    accepted = frozenset(sig.parameters)
+    unknown = kwarg_names - accepted
+    if unknown:
+        raise RuntimeError(
+            "The installed FlashInfer trtllm_fp4_block_scale_moe does not "
+            f"accept argument(s) {sorted(unknown)}; the FlashInfer version "
+            "does not match vLLM's call contract."
+        )
+    return accepted
 
 
 class TrtLlmNvFp4ExpertsBase:
@@ -558,7 +590,7 @@ class TrtLlmNvFp4ExpertsMonolithic(
         # Invoke kernel.
         # NOTE: Activation padding and output
         # truncation are handled by the MoE runner's
-        result = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+        kernel_kwargs: dict = dict(
             routing_logits=router_logits,
             routing_bias=e_score_correction_bias,
             hidden_states=hidden_states,
@@ -584,14 +616,32 @@ class TrtLlmNvFp4ExpertsMonolithic(
             intermediate_size=self.intermediate_size_per_partition,
             local_expert_offset=self.ep_rank * self.local_num_experts,
             local_num_experts=self.local_num_experts,
+            # With apply_routed_scale_to_output the runner scales the output
+            # post-finalize, so the neutral 1.0 forwarded here is intentional.
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=self.routing_method_type,
             do_finalize=not defer,
             activation_type=activation_to_flashinfer_int(activation),
             per_token_scale=per_token_scale,
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
-            routing_replay_out=routing_replay_out,
         )
+        accepted = _fi_fp4_moe_accepted_params(frozenset(kernel_kwargs))
+        if accepted is not None and "norm_topk_prob" in accepted:
+            # vLLM maps only renormalize=True configs to the flag-sensitive
+            # routing methods (e.g. DeepSeekV3), so pin the wrapper default
+            # explicitly instead of relying on it.
+            kernel_kwargs["norm_topk_prob"] = True
+        # Pass routing_replay_out only when a capture buffer is live; None is
+        # the wrapper default and older wrappers lack the kwarg entirely.
+        if routing_replay_out is not None:
+            if accepted is not None and "routing_replay_out" not in accepted:
+                raise RuntimeError(
+                    "Routing replay capture requires a FlashInfer "
+                    "trtllm_fp4_block_scale_moe with routing_replay_out "
+                    "support."
+                )
+            kernel_kwargs["routing_replay_out"] = routing_replay_out
+        result = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(**kernel_kwargs)
         self._maybe_dispatch_routing_replay(routing_replay_out, num_tokens=num_tokens)
         if defer:
             # flashinfer returns a flat permute map; the protocol wants

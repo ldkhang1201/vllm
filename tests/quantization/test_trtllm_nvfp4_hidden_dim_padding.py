@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
@@ -72,9 +73,12 @@ def test_align_trtllm_fp4_moe_hidden_dim_noop():
     assert out_w2_scale is w2_scale
 
 
-def test_align_trtllm_fp4_moe_hidden_dim_pads_to_256_multiple():
+def test_align_trtllm_fp4_moe_hidden_dim_pads_to_512_multiple():
+    # 2688 is 128- and 256-aligned but not 512-aligned; the TRTLLM-Gen NVFP4
+    # kernel only supports 512-aligned hidden sizes (issue #52308), so the
+    # pad target must be 3072, not 2816.
     hidden_dim = 2688
-    padded_hidden_dim = 2816
+    padded_hidden_dim = 3072
 
     w13 = torch.arange(2 * 12 * (hidden_dim // 2), dtype=torch.uint8).reshape(
         2, 12, hidden_dim // 2
@@ -107,3 +111,32 @@ def test_align_trtllm_fp4_moe_hidden_dim_pads_to_256_multiple():
     assert torch.count_nonzero(out_w13_scale[:, :, hidden_dim // 16 :]) == 0
     assert torch.count_nonzero(out_w2[:, hidden_dim:, :]) == 0
     assert torch.count_nonzero(out_w2_scale[:, hidden_dim:, :]) == 0
+
+
+def test_padded_hidden_zero_fill_check():
+    hidden_dim = 2688
+    w13, w13_scale, w2, w2_scale, _ = align_trtllm_fp4_moe_hidden_dim_for_fi(
+        torch.ones(2, 12, hidden_dim // 2, dtype=torch.uint8),
+        torch.ones(2, 12, hidden_dim // 16, dtype=torch.uint8),
+        torch.ones(2, hidden_dim, 6, dtype=torch.uint8),
+        torch.ones(2, hidden_dim, 2, dtype=torch.uint8),
+    )
+    flashinfer_fp4_moe._check_padded_hidden_zero_fill(
+        w13, w13_scale, w2, w2_scale, hidden_dim
+    )
+
+    w13_scale[0, 0, -1] = 1
+    with pytest.raises(AssertionError, match="w13_scale"):
+        flashinfer_fp4_moe._check_padded_hidden_zero_fill(
+            w13, w13_scale, w2, w2_scale, hidden_dim
+        )
+
+
+def test_permutation_bijective_check():
+    flashinfer_fp4_moe._check_permutation_bijective(
+        torch.randperm(128), 128, "gemm1_weights"
+    )
+    with pytest.raises(AssertionError, match="gemm2_weights"):
+        flashinfer_fp4_moe._check_permutation_bijective(
+            torch.zeros(128, dtype=torch.long), 128, "gemm2_weights"
+        )

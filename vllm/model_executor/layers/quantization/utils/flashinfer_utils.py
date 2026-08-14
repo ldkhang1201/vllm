@@ -255,8 +255,18 @@ def align_trtllm_fp4_moe_hidden_dim_for_fi(
     w13_scale: torch.Tensor,
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
-    min_alignment: int = 256,
+    min_alignment: int = 512,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Zero-pad the hidden dim so TRTLLM-Gen NVFP4 MoE kernels support it.
+
+    The TRTLLM-Gen NVFP4 MoE kernels only support hidden sizes that are
+    multiples of 512; before weight padding existed the backend rejected
+    ``hidden_dim % 512 != 0`` outright. Padding to 256 yields hidden dims
+    (e.g. 2688 -> 2816 for Nemotron-3-Nano) that pass shape checks but
+    violate the kernel's K-tiling of the interleaved block scales, applying
+    wrong scales in every expert GEMM (see issue #52308). Pad to 512 so the
+    padded dim is inside the kernel's supported set.
+    """
     num_experts, gate_up_dim, packed_hidden_size = w13.shape
     hidden_size = packed_hidden_size * 2
     padded_hidden_size = round_up(hidden_size, min_alignment)

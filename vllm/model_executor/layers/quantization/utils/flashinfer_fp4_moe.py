@@ -189,6 +189,53 @@ def nvfp4_swizzled_scale_to_cutedsl_mma_view(scale: torch.Tensor) -> torch.Tenso
     return mma_view
 
 
+def _check_permutation_bijective(
+    indices: torch.Tensor, num_rows: int, name: str
+) -> None:
+    """Verify a TRTLLM epilogue-tile permutation is a row bijection.
+
+    A non-bijective permutation silently duplicates/drops weight or
+    block-scale rows and corrupts the expert GEMMs (issue #52308).
+    """
+    if indices.numel() != num_rows or not torch.equal(
+        indices.sort().values,
+        torch.arange(num_rows, dtype=indices.dtype, device=indices.device),
+    ):
+        raise AssertionError(
+            f"{name}: flashinfer permute indices (numel={indices.numel()}) "
+            f"are not a bijection over {num_rows} rows"
+        )
+
+
+def _check_padded_hidden_zero_fill(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    unpadded_hidden: int,
+) -> None:
+    """Verify the hidden-dim padding feeding the TRTLLM shuffle is zeroed.
+
+    Nonzero payloads or block scales in the padded hidden region contribute
+    garbage to every expert GEMM after the epilogue-tile shuffle and scale
+    interleave (issue #52308).
+    """
+    checks = (
+        ("w13", w13[..., unpadded_hidden // 2 :]),
+        ("w13_scale", w13_scale.view(torch.uint8)[..., unpadded_hidden // 16 :]),
+        ("w2", w2[:, unpadded_hidden:]),
+        ("w2_scale", w2_scale.view(torch.uint8)[:, unpadded_hidden:]),
+    )
+    for name, padded_region in checks:
+        num_bad = int(torch.count_nonzero(padded_region))
+        if num_bad:
+            raise AssertionError(
+                f"{name}: {num_bad} nonzero bytes in the hidden-dim padded "
+                f"region (unpadded hidden {unpadded_hidden}); TRTLLM NVFP4 "
+                "MoE prep requires zero-filled padding"
+            )
+
+
 def prepare_static_weights_for_trtllm_fp4_moe(
     # args_dequant,
     # args,
@@ -246,6 +293,10 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             epilogue_tile_m,
             is_gated_act_gemm=is_gated_activation,
         )
+        if i == 0:
+            _check_permutation_bijective(
+                permute_indices, gemm1_intermediate_size, "gemm1_weights"
+            )
         gemm1_weights_fp4_shuffled.append(
             gemm1_weights_fp4[i]
             .view(torch.uint8)[permute_indices.to(gemm1_weights_fp4.device)]
@@ -259,6 +310,10 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             num_elts_per_sf=16,
             is_gated_act_gemm=is_gated_activation,
         )
+        if i == 0:
+            _check_permutation_bijective(
+                permute_sf_indices, gemm1_intermediate_size, "gemm1_weights_scale"
+            )
         gemm1_scales_fp4_shuffled.append(
             nvfp4_block_scale_interleave(
                 gemm1_scales_linear_fp4[i]
@@ -274,6 +329,8 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             gemm2_weights_fp4[i].view(torch.uint8),
             epilogue_tile_m,
         )
+        if i == 0:
+            _check_permutation_bijective(permute_indices, hidden_size, "gemm2_weights")
         gemm2_weights_fp4_shuffled.append(
             gemm2_weights_fp4[i]
             .view(torch.uint8)[permute_indices.to(gemm2_weights_fp4.device)]
@@ -286,6 +343,10 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             epilogue_tile_m,
             num_elts_per_sf=16,
         )
+        if i == 0:
+            _check_permutation_bijective(
+                permute_sf_indices, hidden_size, "gemm2_weights_scale"
+            )
         gemm2_scales_fp4_shuffled.append(
             nvfp4_block_scale_interleave(
                 gemm2_scales_linear_fp4[i]
@@ -383,6 +444,7 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
 
     # Shuffle weights and scales for FI TRTLLM NVFP4 MoE kernels.
     if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
+        unpadded_hidden = w13.size(-1) * 2
         w13, w13_scale, w2, w2_scale, padded_hidden = (
             align_trtllm_fp4_moe_hidden_dim_for_fi(w13, w13_scale, w2, w2_scale)
         )
@@ -404,6 +466,11 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
             )
         )
         layer.moe_config.intermediate_size_per_partition = padded_intermediate
+
+        if padded_hidden != unpadded_hidden:
+            _check_padded_hidden_zero_fill(
+                w13, w13_scale, w2, w2_scale, unpadded_hidden
+            )
 
         w13, w13_scale, w2, w2_scale = prepare_static_weights_for_trtllm_fp4_moe(
             w13,

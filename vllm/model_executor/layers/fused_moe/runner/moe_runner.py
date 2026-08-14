@@ -538,7 +538,7 @@ class MoERunner(MoERunnerInterface):
         # MoE with routed output transform or shared experts:
         #   - pre_xform applies if the transform needs unpadded routed output
         #     or shared+routed add needs matching hidden dims. For Nemotron-3
-        #     Nano, TRTLLM NVFP4 pads routed MoE hidden dim 2688->2816, while
+        #     Nano, TRTLLM NVFP4 pads routed MoE hidden dim 2688->3072, while
         #     shared output stays 2688.
         #   - post_xform uses shared_experts_hidden_dim when transform and shared
         #     experts make the final output full hidden dim.

@@ -242,10 +242,11 @@ class TrtLlmNvFp4ExpertsBase:
 
     @staticmethod
     def _supports_shape(hidden_dim: int) -> bool:
-        # Weights are zero-padded to 256-alignment at load time and the MoE
-        # runner pads activations via _maybe_pad_hidden_states, so any
-        # hidden_dim is accepted.
-        # NOTE: non-256-aligned dims will trigger a warning log and may
+        # Weights are zero-padded to 512-alignment (the TRTLLM-Gen kernel's
+        # supported hidden-size set) at load time and the MoE runner pads
+        # activations via _maybe_pad_hidden_states, so any hidden_dim is
+        # accepted.
+        # NOTE: non-512-aligned dims will trigger a warning log and may
         # cause performance degradation due to activation slicing.
         return True
 

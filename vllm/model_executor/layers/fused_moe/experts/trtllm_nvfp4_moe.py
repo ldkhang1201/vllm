@@ -16,6 +16,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.moe_output import (
     UnfinalizedMoEOutput,
 )
+from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
+    grouped_topk,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
@@ -555,12 +558,23 @@ class TrtLlmNvFp4ExpertsMonolithic(
             num_tokens=num_tokens,
             device=hidden_states.device,
         )
+
+        # The in-kernel DeepSeekV3 routing is wrong for the degenerate
+        # single-group case (n_group == 1, e.g. Nemotron-3-Nano), corrupting
+        # the output (https://github.com/vllm-project/vllm/issues/52308).
+        # Route those models externally with vLLM's grouped_topk (the same
+        # reference the modular path uses) and hand the kernel the
+        # precomputed selection instead.
+        external_routing = (
+            self.routing_method_type == RoutingMethodType.DeepSeekV3
+            and (num_expert_group or 1) == 1
+        )
+        topk_weights: torch.Tensor | None = None
+
         # Invoke kernel.
         # NOTE: Activation padding and output
         # truncation are handled by the MoE runner's
-        result = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
-            routing_logits=router_logits,
-            routing_bias=e_score_correction_bias,
+        common_kwargs = dict(
             hidden_states=hidden_states,
             hidden_states_scale=block_scale.view(torch.float8_e4m3fn).reshape(
                 *hidden_states.shape[:-1], -1
@@ -579,26 +593,63 @@ class TrtLlmNvFp4ExpertsMonolithic(
             output2_scale_scalar=self.quant_config.g2_alphas,
             num_experts=global_num_experts,
             top_k=self.topk,
-            n_group=(num_expert_group or 0),
-            topk_group=(topk_group or 0),
             intermediate_size=self.intermediate_size_per_partition,
             local_expert_offset=self.ep_rank * self.local_num_experts,
             local_num_experts=self.local_num_experts,
-            routed_scaling_factor=routed_scaling_factor,
-            routing_method_type=self.routing_method_type,
             do_finalize=not defer,
             activation_type=activation_to_flashinfer_int(activation),
             per_token_scale=per_token_scale,
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
-            routing_replay_out=routing_replay_out,
         )
+        if external_routing:
+            assert e_score_correction_bias is not None
+            # DeepSeekV3 in vLLM implies sigmoid scoring with renormalize.
+            topk_weights, topk_ids = grouped_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=self.topk,
+                renormalize=True,
+                num_expert_group=1,
+                topk_group=(topk_group or 1),
+                scoring_func="sigmoid",
+                routed_scaling_factor=(routed_scaling_factor or 1.0),
+                e_score_correction_bias=e_score_correction_bias,
+            )
+            result = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
+                topk_ids=trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights),
+                routing_bias=None,
+                n_group=0,
+                topk_group=0,
+                routed_scaling_factor=None,
+                routing_method_type=1,  # not used
+                **common_kwargs,
+            )
+            if routing_replay_out is not None:
+                routing_replay_out[:num_tokens].copy_(topk_ids.to(torch.int16))
+        else:
+            result = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+                routing_logits=router_logits,
+                routing_bias=e_score_correction_bias,
+                n_group=(num_expert_group or 0),
+                topk_group=(topk_group or 0),
+                routed_scaling_factor=routed_scaling_factor,
+                routing_method_type=self.routing_method_type,
+                routing_replay_out=routing_replay_out,
+                **common_kwargs,
+            )
         self._maybe_dispatch_routing_replay(routing_replay_out, num_tokens=num_tokens)
         if defer:
             # flashinfer returns a flat permute map; the protocol wants
             # [num_tokens, top_k] so consumers can read top_k from its shape.
+            # With precomputed routing the kernel-side expert_weights buffer
+            # is a placeholder, so return the externally computed weights.
             return UnfinalizedMoEOutput(
                 gemm2_permuted=result[0],
-                expert_weights=result[1],
+                expert_weights=(
+                    topk_weights.to(torch.bfloat16)
+                    if topk_weights is not None
+                    else result[1]
+                ),
                 expanded_idx_to_permuted_idx=result[2]
                 .to(torch.int32)
                 .view(num_tokens, self.topk),

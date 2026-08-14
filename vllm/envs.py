@@ -214,6 +214,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
+    VLLM_TRTLLM_MOE_NONGATED_SCALE_C: Literal["requant", "gated", "square"] = "requant"
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1728,6 +1729,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
+    ),
+    # Debug knob for the non-gated (e.g. Relu2) NVFP4 FlashInfer TRTLLM MoE
+    # scale fusion (issue #52308). Selects what output1_scale_scalar carries:
+    # "requant" (default): FC2 input requant only; the kernel is expected to
+    # apply the GEMM1 dequant via output1_scale_gate_scalar inside the
+    # activation. "gated"/"square": additionally fold the GEMM1 dequant in
+    # once/twice, for kernels applying the gate scalar one/zero times.
+    "VLLM_TRTLLM_MOE_NONGATED_SCALE_C": env_with_choices(
+        "VLLM_TRTLLM_MOE_NONGATED_SCALE_C",
+        "requant",
+        ["requant", "gated", "square"],
     ),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for

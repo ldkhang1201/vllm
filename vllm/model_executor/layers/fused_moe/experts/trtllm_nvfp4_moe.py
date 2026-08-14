@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import logging
+
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -40,6 +43,46 @@ logger = init_logger(__name__)
 # Base scale for per-token NVFP4 activation quant; the kernel folds the
 # per-token global scale (from the activation amax) on top of it.
 _PER_TOKEN_BASE_GLOBAL_SCALE = 1.0 / (448.0 * 6.0)
+
+# Set once the first MoE layer has dumped its fused scalars (issue #52308).
+_scale_probe_logged = False
+
+
+def _scale_stats(t: torch.Tensor | None) -> str:
+    if t is None:
+        return "None"
+    v = t.detach().float().flatten()
+    head = ", ".join(f"{x:.6e}" for x in v[:4].tolist())
+    return (
+        f"shape={tuple(t.shape)} min={v.min().item():.6e} "
+        f"max={v.max().item():.6e} head=[{head}]"
+    )
+
+
+def _nongated_g1_scale_c(
+    g1_alphas: torch.Tensor, a2_gscale: torch.Tensor
+) -> torch.Tensor:
+    """Fuse ``output1_scale_scalar`` for non-gated (e.g. ReLU^2) NVFP4 MoE.
+
+    The default ``requant`` mode follows the FlashInfer reference contract:
+    the kernel applies ``output1_scale_gate_scalar`` (the GEMM1 dequant)
+    inside the eltwise activation, so this scalar carries only the FC2
+    input requant factor. ``gated`` and ``square`` additionally fold the
+    GEMM1 dequant in once or twice, discriminating a kernel that applies
+    the gate scalar one or zero times for eltwise activations (#52308).
+    """
+    mode = envs.VLLM_TRTLLM_MOE_NONGATED_SCALE_C
+    if mode != "requant":
+        logger.warning_once(
+            "Overriding non-gated NVFP4 TRTLLM MoE output1_scale_scalar "
+            "fusion: VLLM_TRTLLM_MOE_NONGATED_SCALE_C=%s",
+            mode,
+        )
+    if mode == "gated":
+        return g1_alphas * a2_gscale
+    if mode == "square":
+        return g1_alphas.square() * a2_gscale
+    return a2_gscale.clone()
 
 
 class TrtLlmNvFp4ExpertsBase:
@@ -154,7 +197,9 @@ class TrtLlmNvFp4ExpertsBase:
         if self.moe_config.is_act_and_mul:
             g1_scale_c = self.quant_config.g1_alphas * self.quant_config.a2_gscale
         else:
-            g1_scale_c = self.quant_config.a2_gscale.clone()
+            g1_scale_c = _nongated_g1_scale_c(
+                self.quant_config.g1_alphas, self.quant_config.a2_gscale
+            )
         layer.register_parameter(
             "g1_scale_c",
             torch.nn.Parameter(g1_scale_c, requires_grad=False),
@@ -200,6 +245,53 @@ class TrtLlmNvFp4ExpertsBase:
                 torch.nn.Parameter(self.gemm1_alpha, requires_grad=False),
             )
             self.gemm1_alpha = layer.gemm1_alpha
+
+        self._log_scale_fusion_probe(layer)
+
+    def _log_scale_fusion_probe(self, layer: torch.nn.Module) -> None:
+        """Dump the fused TRTLLM kernel scalars for the first MoE layer.
+
+        Serve-time probe for #52308: logs the three per-expert scalars
+        handed to ``trtllm_fp4_block_scale_moe``, the primitive scale set
+        shared with the modular FLASHINFER_CUTLASS path (its
+        ``quant_scales = [a1_gscale, w1_scale, g1_alphas, a2_gscale,
+        w2_scale, g2_alphas]``), and the alternative non-gated fusions of
+        ``output1_scale_scalar``, so a kernel-side scale-contract mismatch
+        can be read off the serve logs.
+        """
+        global _scale_probe_logged
+        if _scale_probe_logged or not logger.isEnabledFor(logging.DEBUG):
+            return
+        _scale_probe_logged = True
+        qc = self.quant_config
+        assert qc.g1_alphas is not None and qc.a2_gscale is not None
+        logger.debug(
+            "NVFP4 TRTLLM MoE scale-fusion probe (first MoE layer): "
+            "activation=%s is_act_and_mul=%s local_num_experts=%d "
+            "nongated_scale_c_mode=%s\n"
+            "  kernel output1_scale_scalar (g1_scale_c): %s\n"
+            "  kernel output1_scale_gate_scalar (g1_alphas): %s\n"
+            "  kernel output2_scale_scalar (g2_alphas): %s\n"
+            "  modular-path a1_gscale: %s\n"
+            "  modular-path a2_gscale: %s\n"
+            "  raw w13_input_scale: %s\n"
+            "  raw w2_input_scale: %s\n"
+            "  alt scale_c 'gated' (g1_alphas*a2_gscale): %s\n"
+            "  alt scale_c 'square' (g1_alphas^2*a2_gscale): %s",
+            self.moe_config.activation,
+            self.moe_config.is_act_and_mul,
+            self.local_num_experts,
+            envs.VLLM_TRTLLM_MOE_NONGATED_SCALE_C,
+            _scale_stats(self.g1_scale_c),
+            _scale_stats(qc.g1_alphas),
+            _scale_stats(qc.g2_alphas),
+            _scale_stats(qc.a1_gscale),
+            _scale_stats(qc.a2_gscale),
+            _scale_stats(getattr(layer, "w13_input_scale", None)),
+            _scale_stats(getattr(layer, "w2_input_scale", None)),
+            _scale_stats(qc.g1_alphas * qc.a2_gscale),
+            _scale_stats(qc.g1_alphas.square() * qc.a2_gscale),
+        )
 
     @staticmethod
     def _supports_current_device() -> bool:
